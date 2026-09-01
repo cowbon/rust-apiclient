@@ -169,6 +169,30 @@ pub enum Nonce {
     Value(Vec<u8>),
 }
 
+/// Serde codec for the nonce representation used by challenge-response
+/// sessions: unpadded base64url (RFC 4648, section 5).
+mod base64url_nopad {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    pub fn serialize<S>(value: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+
+        URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl ChallengeResponse {
     /// Run a challenge-response verification session using the supplied nonce
     /// configuration and evidence creation callback. Returns the raw attestation results, or an
@@ -361,7 +385,7 @@ const DISCOVERY_MEDIA_TYPE: &str = "application/vnd.veraison.discovery+json";
 #[serde_with::skip_serializing_none]
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct ChallengeResponseSession {
-    #[serde_as(as = "serde_with::base64::Base64")]
+    #[serde(with = "base64url_nopad")]
     nonce: Vec<u8>,
     #[serde_as(as = "chrono::DateTime<chrono::Utc>")]
     expiry: chrono::NaiveDateTime,
@@ -764,6 +788,36 @@ mod tests {
 
         // Expect we are given the expected location URL
         assert_eq!(rv.0, format!("{}/1234", mock_server.uri()));
+    }
+
+    #[async_std::test]
+    async fn new_session_decodes_unpadded_base64url_nonce() {
+        let mock_server = MockServer::start().await;
+        let response = ResponseTemplate::new(201)
+            .insert_header("location", "1234")
+            // `-_8` is the unpadded base64url encoding of [0xfb, 0xff].
+            .set_body_raw(
+                r#"{"nonce":"-_8","expiry":"2024-01-01T00:00:00Z","accept":[],"status":"waiting"}"#,
+                "application/vnd.veraison.challenge-response-session+json",
+            );
+
+        Mock::given(method("POST"))
+            .and(path("/newSession"))
+            .respond_with(response)
+            .mount(&mock_server)
+            .await;
+
+        let cr = ChallengeResponseBuilder::new()
+            .with_new_session_url(mock_server.uri() + "/newSession")
+            .build()
+            .unwrap();
+
+        let (_, session) = cr
+            .new_session(&Nonce::Size(2))
+            .await
+            .expect("unexpected failure");
+
+        assert_eq!(session.nonce(), [0xfb, 0xff]);
     }
 
     #[async_std::test]
